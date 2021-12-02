@@ -1,3 +1,4 @@
+//go:build windows
 // +build windows
 
 /*
@@ -175,11 +176,13 @@ func (c *criService) CreateContainer(ctx context.Context, r *runtime.CreateConta
 		"spec":           spew.NewFormatter(spec),
 	}).Debug("Container creation")
 
+	usePodScratch := false
 	// If the config field is specified, set the snapshotter label to reuse the pods
 	// scratch space. This only affects LCOW at the moment.
-	val, ok := config.Annotations["containerd.io/snapshot/io.microsoft.container.storage.reuse-scratch"]
+	val, ok := config.Annotations[annotations.ReuseScratch]
 	if rhcso.ShareScratch || (ok && val == "true") {
-		config.Annotations["containerd.io/snapshot/io.microsoft.container.storage.reuse-scratch"] = "true"
+		usePodScratch = true
+		config.Annotations[annotations.ReuseScratch] = "true"
 		_, ok := config.Annotations["containerd.io/snapshot/io.microsoft.owner.key"]
 		if !ok {
 			config.Annotations["containerd.io/snapshot/io.microsoft.owner.key"] = sandboxID
@@ -188,18 +191,75 @@ func (c *criService) CreateContainer(ctx context.Context, r *runtime.CreateConta
 
 	if rhcso.DefaultContainerScratchSizeInGb != 0 {
 		size := strconv.FormatInt(int64(rhcso.DefaultContainerScratchSizeInGb), 10)
-		annotationSize, ok := config.Annotations["containerd.io/snapshot/io.microsoft.container.storage.rootfs.size-gb"]
+		annotationSize, ok := config.Annotations[annotations.ScratchVhdSize]
 		if !ok {
-			config.Annotations["containerd.io/snapshot/io.microsoft.container.storage.rootfs.size-gb"] = size
+			config.Annotations[annotations.ScratchVhdSize] = size
 		} else {
 			log.G(ctx).Debugf("Changing default container scratch size for %s from %s to %s", id, size, annotationSize)
 		}
 	}
+	// Set snapshotter before any other options.
+	snapshotter := c.getDefaultSnapshotterForPlatform(sandboxPlatform)
+
+	cidOther, useExistingScratch := config.Annotations[annotations.CopyExistingScratch]
+	if useExistingScratch {
+		if usePodScratch {
+			return nil, errors.Errorf("cannot use both annotations %q and %q",
+				annotations.ReuseScratch, annotations.CopyExistingScratch)
+		}
+
+		ctr, err := c.containerStore.Get(cidOther)
+		if err != nil {
+			return nil, errors.Wrapf(err, "could not retrieve container %q", cidOther)
+		}
+		if image.ID != ctr.ImageRef {
+			return nil, errors.Errorf("existing scratch space from is for image %q, not %q", ctr.ImageRef, image.ID)
+		}
+
+		state := ctr.Status.Get().State()
+		if (state != runtime.ContainerState_CONTAINER_CREATED) && (state != runtime.ContainerState_CONTAINER_EXITED) {
+			return nil, errors.Errorf("container is not stopped: %q", state.String())
+		}
+
+		ci, err := ctr.Container.Info(ctx)
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to get container info")
+		}
+
+		if snapshotter != ci.Snapshotter {
+			return nil, errors.Errorf("existing scratch space is from snapshotter %q, not %q", ci.Snapshotter, snapshotter)
+		}
+
+		ss := c.client.SnapshotService(ci.Snapshotter)
+		ms, err := ss.Mounts(ctx, ci.SnapshotKey)
+		if err != nil {
+			return nil, errors.Errorf("could not retrive snapshot mounts")
+		}
+
+		if len(ms) != 1 {
+			return nil, errors.Errorf("expected 1 mount, found %d", len(ms))
+		}
+
+		m := ms[0]
+		path := filepath.Join(m.Source, "sandbox.vhdx")
+		config.Annotations[annotations.CopyScratchVhd] = path
+
+		log.G(ctx).WithFields(logrus.Fields{
+			"id":        id,
+			"sourceVHD": path,
+			"sourceCid": cidOther,
+		}).Debug("copying scratch space vhd mounted on existing container")
+
+		// remove scratch space from the old container, to prevent garbage collection
+		// ctr.Container.Update(ctx, func(ctx context.Context, client *containerd.Client, c *containers.Container) error {
+		// 	c.Snapshotter = ""
+		// 	return nil
+		// })
+	}
 
 	snapshotterOpt := snapshots.WithLabels(snapshots.FilterInheritedLabels(config.Annotations))
-	// Set snapshotter before any other options.
 	opts := []containerd.NewContainerOpts{
-		containerd.WithSnapshotter(c.getDefaultSnapshotterForPlatform(sandboxPlatform)),
+		containerd.WithSnapshotter(snapshotter),
 		customopts.WithNewSnapshot(id, containerdImage, snapshotterOpt),
 	}
 
@@ -277,6 +337,8 @@ func (c *criService) CreateContainer(ctx context.Context, r *runtime.CreateConta
 	if err := c.containerStore.Add(container); err != nil {
 		return nil, errors.Wrapf(err, "failed to add container %q into store", id)
 	}
+
+	// debug info
 
 	return &runtime.CreateContainerResponse{ContainerId: id}, nil
 }

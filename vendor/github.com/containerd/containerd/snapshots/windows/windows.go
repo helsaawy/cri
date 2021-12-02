@@ -1,3 +1,4 @@
+//go:build windows
 // +build windows
 
 /*
@@ -37,6 +38,7 @@ import (
 	"github.com/containerd/containerd/snapshots/storage"
 	"github.com/containerd/continuity/fs"
 	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
 )
 
 func init() {
@@ -51,6 +53,7 @@ func init() {
 
 const (
 	rootfsSizeLabel = "containerd.io/snapshot/io.microsoft.container.storage.rootfs.size-gb"
+	copyScratchVhd  = "containerd.io/snapshot/io.microsoft.container.storage.copy-scratch-vhd"
 )
 
 type snapshotter struct {
@@ -355,13 +358,24 @@ func (s *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 				parentPath = parentLayerPaths[0]
 			}
 
-			if err := hcsshim.CreateSandboxLayer(s.info, newSnapshot.ID, parentPath, parentLayerPaths); err != nil {
-				return nil, errors.Wrap(err, "failed to create sandbox layer")
-			}
-
 			var snapshotInfo snapshots.Info
 			for _, o := range opts {
 				o(&snapshotInfo)
+			}
+
+			if sourceVhd, ok := snapshotInfo.Labels[copyScratchVhd]; ok {
+				dstVhd := filepath.Join(snDir, "sandbox.vhdx")
+				log.G(ctx).WithFields(logrus.Fields{
+					"source":      sourceVhd,
+					"destination": dstVhd,
+				}).Debug("copying vdh for scratch layer")
+				if err := fs.CopyFile(dstVhd, sourceVhd); err != nil {
+					return nil, errors.Wrapf(err, "failed to copy sandox vhdx")
+				}
+			} else {
+				if err := hcsshim.CreateSandboxLayer(s.info, newSnapshot.ID, parentPath, parentLayerPaths); err != nil {
+					return nil, errors.Wrap(err, "failed to create sandbox layer")
+				}
 			}
 
 			var sizeGB int

@@ -1,3 +1,4 @@
+//go:build windows
 // +build windows
 
 /*
@@ -182,9 +183,9 @@ func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandbox
 
 	if rhcso.DefaultContainerScratchSizeInGb != 0 {
 		size := strconv.FormatInt(int64(rhcso.DefaultContainerScratchSizeInGb), 10)
-		annotationSize, ok := config.Annotations["containerd.io/snapshot/io.microsoft.container.storage.rootfs.size-gb"]
+		annotationSize, ok := config.Annotations[annotations.ScratchVhdSize]
 		if !ok {
-			config.Annotations["containerd.io/snapshot/io.microsoft.container.storage.rootfs.size-gb"] = size
+			config.Annotations[annotations.ScratchVhdSize] = size
 		} else {
 			log.G(ctx).Debugf("Changing default container scratch size for %s from %s to %s", id, size, annotationSize)
 		}
